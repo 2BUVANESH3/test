@@ -237,15 +237,15 @@ CERT_FOUND=false
 TARGET_CERT="$HOME/.cloudflared/cert.pem"
 mkdir -p "$HOME/.cloudflared"
 
-# Search locations for cert.pem
+# Search locations for cert.pem (including root and custom paths)
 LOCATIONS=(
     "$HOME/.cloudflared/cert.pem"
     "/root/.cloudflared/cert.pem"
     "/.cloudflared/cert.pem"
-    "/.cloudfared/cert.pem" 
     "/etc/cloudflared/cert.pem"
 )
 
+# Try to find the cert in known locations
 for LOC in "${LOCATIONS[@]}"; do
     if sudo test -f "$LOC"; then
         log_success "Found certificate at: $LOC"
@@ -259,10 +259,26 @@ for LOC in "${LOCATIONS[@]}"; do
     fi
 done
 
+# Fallback: If not found in known list, search the whole system (fast)
+if [ "$CERT_FOUND" = false ]; then
+    log_info "Searching system for cert.pem..."
+    # Find cert.pem in / (exclude proc/sys/dev to save time/errors)
+    FOUND_LOC=$(sudo find / -maxdepth 4 -name "cert.pem" 2>/dev/null | grep "cloudflared" | head -n 1)
+    
+    if [ -n "$FOUND_LOC" ]; then
+        log_success "Found certificate at: $FOUND_LOC"
+        sudo cp "$FOUND_LOC" "$TARGET_CERT"
+        sudo chown $USER:$USER "$TARGET_CERT"
+        CERT_FOUND=true
+    fi
+fi
+
 if [ "$CERT_FOUND" = false ]; then
     log_warning "Certificate not found automatically."
     log_warning "Please log in via the browser link below:"
     cloudflared tunnel login
+else
+    log_success "Certificate verified."
 fi
 
 #############################################################################
@@ -299,6 +315,11 @@ CRED_FILE=$(find $HOME/.cloudflared -name "${TUNNEL_ID}.json" 2>/dev/null | head
 # If not in home, check /root (via sudo)
 if [ -z "$CRED_FILE" ]; then
     sudo test -f "/root/.cloudflared/${TUNNEL_ID}.json" && CRED_FILE="/root/.cloudflared/${TUNNEL_ID}.json"
+fi
+
+# Fallback search
+if [ -z "$CRED_FILE" ]; then
+     CRED_FILE=$(sudo find / -maxdepth 4 -name "${TUNNEL_ID}.json" 2>/dev/null | head -n 1)
 fi
 
 if [ -z "$CRED_FILE" ]; then
