@@ -45,8 +45,7 @@ chown $USER_NAME:$USER_NAME $BACKUP_DIR
 echo ">>> Finding latest Bedrock Server version..."
 # We scrape the official page for the linux zip link.
 # Note: This relies on the specific HTML structure of the download page.
-DOWNLOAD_URL=$(curl -L -s -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64)" https://www.minecraft.net/en-us/download/server/bedrock | grep -o 'https://minecraft.azureedge.net/bin-linux/bedrock-server-[0-9.]*\.zip' | head -1)
-
+DOWNLOAD_URL="https://www.minecraft.net/bedrockdedicatedserver/bin-linux/bedrock-server-1.21.132.3.zip"
 if [ -z "$DOWNLOAD_URL" ]; then
     echo "!!! Error: Could not automatically detect the download URL."
     echo "!!! Please download the zip manually from minecraft.net and place it in $INSTALL_DIR."
