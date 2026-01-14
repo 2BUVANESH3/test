@@ -1,55 +1,53 @@
 #!/bin/bash
 
 #############################################################################
-# Complete Multi-Service Deployment Script (Robust Version)
-# Deploys Docker + NGINX + Cloudflare Tunnel
-# Features: Deep Cert Search, Manual Path Fallback, Permission Handling
+# Complete Multi-Service Deployment Script (Correction v3)
+# Fixes: Permission handling, Directory vs File input, Docker Config
 #############################################################################
 
 set -e
 
-# Colors
+# --- Visual Styling ---
+BOLD='\033[1m'
 RED='\033[0;31m'
 GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
-NC='\033[0m'
+YELLOW='\033[1;33m'
+NC='\033[0m' # No Color
 
-# Logging
+# --- Logging Functions ---
 log_info() { echo -e "${BLUE}[INFO]${NC} $1"; }
 log_success() { echo -e "${GREEN}[SUCCESS]${NC} $1"; }
-log_warning() { echo -e "${YELLOW}[WARNING]${NC} $1"; }
+log_warn() { echo -e "${YELLOW}[WARNING]${NC} $1"; }
 log_error() { echo -e "${RED}[ERROR]${NC} $1"; }
+step() { echo ""; echo -e "${BOLD}--- Step $1: $2 ---${NC}"; }
 
-# Check sudo (soft check - doesn't exit if fails, just notes it)
-CAN_SUDO=false
-if sudo -n true 2>/dev/null; then
-    CAN_SUDO=true
-else
-    # Try to prompt once
-    if sudo -v 2>/dev/null; then
-        CAN_SUDO=true
-    else
-        log_warning "Running without sudo/root access. Some system paths may be unreadable."
-    fi
+# --- PRE-FLIGHT CHECKS ---
+
+# 1. Check if running as root (We want normal user)
+if [ "$EUID" -eq 0 ]; then 
+    log_error "Please do NOT run this script as root."
+    log_error "Run it as your normal user: bash deploy.sh"
+    exit 1
 fi
 
-#############################################################################
-# STEP 0: Configuration
-#############################################################################
+# 2. Check Sudo Access
+if ! sudo -n true 2>/dev/null; then
+    log_warn "Sudo access is required for installation."
+    echo "Please enter your password:"
+    sudo -v
+fi
 
 clear
-echo "=========================================="
-echo "  Multi-Service Deployment (Robust)"
-echo "=========================================="
+echo "=================================================="
+echo "   Multi-Service Deployment: The Robust Fix"
+echo "=================================================="
 echo ""
 
-# defaults
-DEFAULT_TUNNEL="myserver"
-DEFAULT_INSTALL="/srv"
+# --- CONFIGURATION INPUT ---
 
-read -p "Enter your domain name (e.g., example.com): " DOMAIN_NAME
-[ -z "$DOMAIN_NAME" ] && { log_error "Domain required"; exit 1; }
+read -p "Enter your Main Domain (e.g., example.com): " DOMAIN_NAME
+[ -z "$DOMAIN_NAME" ] && { log_error "Domain name is required."; exit 1; }
 
 read -p "Enter API subdomain [default: api]: " API_SUB
 API_SUB=${API_SUB:-api}
@@ -58,73 +56,174 @@ read -p "Enter AI subdomain [default: ai]: " AI_SUB
 AI_SUB=${AI_SUB:-ai}
 
 read -p "Enter Tunnel Name [default: myserver]: " TUNNEL_NAME
-TUNNEL_NAME=${TUNNEL_NAME:-$DEFAULT_TUNNEL}
+TUNNEL_NAME=${TUNNEL_NAME:-myserver}
 
-read -p "Enter Install Dir [default: /srv]: " USER_INSTALL_DIR
-INSTALL_DIR=${USER_INSTALL_DIR:-$DEFAULT_INSTALL}
-
-# Domains
-MAIN_DOMAIN="$DOMAIN_NAME"
+# Set Derived Variables
 API_DOMAIN="${API_SUB}.${DOMAIN_NAME}"
 AI_DOMAIN="${AI_SUB}.${DOMAIN_NAME}"
+INSTALL_DIR="/srv"
+LOCAL_CERT_DIR="$HOME/.cloudflared"
+TARGET_CERT="$LOCAL_CERT_DIR/cert.pem"
 
-log_info "Deploying to: $MAIN_DOMAIN, $API_DOMAIN, $AI_DOMAIN"
-echo ""
+step 1 "Certificate Acquisition"
+log_info "Ensuring Cloudflare certificate is accessible..."
 
-#############################################################################
-# STEP 1-5: Setup (Condensed)
-#############################################################################
+mkdir -p "$LOCAL_CERT_DIR"
 
-log_info "Step 1/8: System Setup & Directories..."
+CERT_FOUND=false
 
-# Prerequisites
-if $CAN_SUDO; then
-    sudo apt update -qq >/dev/null 2>&1
-    sudo apt install -y ca-certificates curl gnupg lsb-release >/dev/null 2>&1
-else
-    log_warning "Skipping apt update (no sudo). Ensure packages are installed."
-fi
+# List of probable locations (including Root paths)
+POSSIBLE_LOCATIONS=(
+    "$HOME/.cloudflared/cert.pem"
+    "/root/.cloudflared/cert.pem"
+    "/.cloudflared/cert.pem"
+    "/etc/cloudflared/cert.pem"
+    "/opt/homebrew/etc/cloudflared/cert.pem"
+)
 
-# Directory Structure
-if $CAN_SUDO; then
-    sudo mkdir -p $INSTALL_DIR/{nginx,cloudflared,services/{api,ai,frontend}}
-    sudo chown -R $USER:$USER $INSTALL_DIR
-else
-    # Fallback to local dir if can't write to /srv
-    if [ ! -w "$INSTALL_DIR" ]; then
-        log_warning "Cannot write to $INSTALL_DIR. Using $HOME/deploy instead."
-        INSTALL_DIR="$HOME/deploy"
+# 1. Auto-Search
+for LOC in "${POSSIBLE_LOCATIONS[@]}"; do
+    if sudo test -f "$LOC"; then
+        log_success "Found certificate at: $LOC"
+        
+        # Copy to user directory with correct ownership
+        log_info "Securely copying certificate to $TARGET_CERT..."
+        sudo cp "$LOC" "$TARGET_CERT"
+        sudo chown "$USER":"$USER" "$TARGET_CERT"
+        chmod 600 "$TARGET_CERT"
+        
+        CERT_FOUND=true
+        break
     fi
-    mkdir -p $INSTALL_DIR/{nginx,cloudflared,services/{api,ai,frontend}}
+done
+
+# 2. Manual Input (Robust Fix)
+while [ "$CERT_FOUND" = false ]; do
+    log_warn "Certificate not found in standard paths."
+    echo "Please search for 'cert.pem' on your system."
+    echo "Enter the FULL PATH to the file (or the folder containing it)."
+    read -p "Path: " MANUAL_PATH
+
+    # Clean input (remove quotes if user added them)
+    MANUAL_PATH=$(echo "$MANUAL_PATH" | tr -d '"' | tr -d "'")
+
+    # Check if input is empty
+    if [ -z "$MANUAL_PATH" ]; then
+        log_error "Path cannot be empty. Try again."
+        continue
+    fi
+
+    # Logic: Did user provide a Folder or a File?
+    REAL_FILE=""
+    
+    if [ -d "$MANUAL_PATH" ]; then
+        # User gave a folder (e.g., /home/me)
+        CHECK_FILE="${MANUAL_PATH%/}/cert.pem"
+        log_info "You provided a directory. Checking for $CHECK_FILE..."
+        if sudo test -f "$CHECK_FILE"; then
+            REAL_FILE="$CHECK_FILE"
+        fi
+    elif sudo test -f "$MANUAL_PATH"; then
+        # User gave a direct file
+        REAL_FILE="$MANUAL_PATH"
+    fi
+
+    # Process Result
+    if [ -n "$REAL_FILE" ]; then
+        log_success "Valid certificate found at: $REAL_FILE"
+        sudo cp "$REAL_FILE" "$TARGET_CERT"
+        sudo chown "$USER":"$USER" "$TARGET_CERT"
+        chmod 600 "$TARGET_CERT"
+        CERT_FOUND=true
+    else
+        log_error "Could not find 'cert.pem' at that location."
+        echo "Tip: Run 'sudo find / -name cert.pem' in another terminal to find it."
+    fi
+done
+
+step 2 "System Prerequisites"
+# Update and Install Docker if missing
+if ! command -v docker &> /dev/null; then
+    log_info "Installing Docker..."
+    sudo apt-get update -qq
+    sudo apt-get install -y ca-certificates curl gnupg lsb-release -qq
+    
+    sudo mkdir -p /etc/apt/keyrings
+    [ -f /etc/apt/keyrings/docker.gpg ] && sudo rm /etc/apt/keyrings/docker.gpg
+    curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+    
+    echo \
+      "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu \
+      $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+      
+    sudo apt-get update -qq
+    sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin -qq
+else
+    log_info "Docker is already installed."
 fi
 
-log_success "Working directory: $INSTALL_DIR"
+# Ensure Cloudflared
+if ! command -v cloudflared &> /dev/null; then
+    log_info "Installing cloudflared..."
+    curl -L --output cloudflared.deb https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
+    sudo dpkg -i cloudflared.deb
+    rm cloudflared.deb
+fi
 
-# Generate Configs
-log_info "Step 2/8: Generating Configs..."
+step 3 "Project Structure"
+# Create directories (Robust permission fix)
+if [ ! -d "$INSTALL_DIR" ]; then
+    sudo mkdir -p "$INSTALL_DIR"
+fi
+sudo chown "$USER":"$USER" "$INSTALL_DIR"
+
+mkdir -p $INSTALL_DIR/{nginx,cloudflared,services/{api,ai,frontend}}
+log_success "Directory structure ready at $INSTALL_DIR"
+
+step 4 "Generating Configurations"
 
 # NGINX
 cat > $INSTALL_DIR/nginx/nginx.conf << EOF
 events { worker_connections 1024; }
 http {
-    server { listen 80; server_name $MAIN_DOMAIN; location / { proxy_pass http://frontend:3000; } }
-    server { listen 80; server_name $API_DOMAIN; location / { proxy_pass http://api:8000; } }
-    server { listen 80; server_name $AI_DOMAIN; location / { proxy_pass http://ai:8501; proxy_http_version 1.1; proxy_set_header Upgrade \$http_upgrade; proxy_set_header Connection "upgrade"; } }
+    server {
+        listen 80;
+        server_name $DOMAIN_NAME;
+        location / { proxy_pass http://frontend:3000; }
+    }
+    server {
+        listen 80;
+        server_name $API_DOMAIN;
+        location / { proxy_pass http://api:8000; }
+    }
+    server {
+        listen 80;
+        server_name $AI_DOMAIN;
+        location / {
+            proxy_pass http://ai:8501;
+            proxy_http_version 1.1;
+            proxy_set_header Upgrade \$http_upgrade;
+            proxy_set_header Connection "upgrade";
+        }
+    }
 }
 EOF
 
-# Services (Simplified for brevity)
+# Services (Simplified for reliability)
+# API
 echo 'from fastapi import FastAPI; app=FastAPI(); @app.get("/")' > $INSTALL_DIR/services/api/main.py
-echo 'def r(): return {"s":"ok"}' >> $INSTALL_DIR/services/api/main.py
-echo -e 'FROM python:3.11-slim\nRUN pip install fastapi uvicorn\nCOPY . .\nCMD ["uvicorn","main:app","--host","0.0.0.0"]' > $INSTALL_DIR/services/api/Dockerfile
+echo 'def r(): return {"status":"online","service":"API"}' >> $INSTALL_DIR/services/api/main.py
+echo -e 'FROM python:3.11-slim\nRUN pip install fastapi uvicorn\nCOPY . .\nCMD ["uvicorn","main:app","--host","0.0.0.0","--port","8000"]' > $INSTALL_DIR/services/api/Dockerfile
 
-echo 'import streamlit as st; st.title("AI Service Online")' > $INSTALL_DIR/services/ai/app.py
+# AI
+echo 'import streamlit as st; st.title("AI Service"); st.success("Online")' > $INSTALL_DIR/services/ai/app.py
 echo -e 'FROM python:3.11-slim\nRUN pip install streamlit\nCOPY . .\nCMD ["streamlit","run","app.py","--server.port=8501","--server.address=0.0.0.0"]' > $INSTALL_DIR/services/ai/Dockerfile
 
-echo "<h1>$MAIN_DOMAIN</h1>" > $INSTALL_DIR/services/frontend/index.html
+# Frontend
+echo "<h1>Deployed via Robust Script</h1><p>$DOMAIN_NAME is Live</p>" > $INSTALL_DIR/services/frontend/index.html
 echo -e 'FROM nginx:alpine\nCOPY index.html /usr/share/nginx/html/' > $INSTALL_DIR/services/frontend/Dockerfile
 
-# Compose
+# Docker Compose
 cat > $INSTALL_DIR/docker-compose.yml << EOF
 version: "3.8"
 services:
@@ -136,165 +235,86 @@ services:
     networks: [internal]
   cloudflared:
     image: cloudflare/cloudflared:latest
+    container_name: tunnel_worker
     command: tunnel run
     volumes:
       - ./cloudflared:/etc/cloudflared
     networks: [internal]
-  api: {build: ./services/api, networks: [internal]}
-  ai: {build: ./services/ai, networks: [internal]}
-  frontend: {build: ./services/frontend, networks: [internal]}
-networks: {internal: }
+    restart: always
+  api:
+    build: ./services/api
+    networks: [internal]
+  ai:
+    build: ./services/ai
+    networks: [internal]
+  frontend:
+    build: ./services/frontend
+    networks: [internal]
+networks:
+  internal:
 EOF
 
-#############################################################################
-# STEP 6: CERTIFICATE HUNT (The Fix)
-#############################################################################
+step 5 "Tunnel Setup"
 
-log_info "Step 3/8: Locating Cloudflare Certificate..."
-
-CERT_FOUND=false
-TARGET_CERT="$HOME/.cloudflared/cert.pem"
-mkdir -p "$HOME/.cloudflared"
-
-# 1. Define specific paths to check first
-PATHS_TO_CHECK=(
-    "$HOME/.cloudflared/cert.pem"
-    "/.cloudflared/cert.pem"
-    "/.cloudfared/cert.pem"
-    "/etc/cloudflared/cert.pem"
-    "/root/.cloudflared/cert.pem"
-)
-
-# 2. Check specific paths
-for LOC in "${PATHS_TO_CHECK[@]}"; do
-    # Use sudo if available, else standard test
-    if $CAN_SUDO; then
-        if sudo test -f "$LOC"; then
-            FOUND_LOC="$LOC"
-            break
-        fi
-    else
-        if [ -f "$LOC" ]; then
-            FOUND_LOC="$LOC"
-            break
-        fi
-    fi
-done
-
-# 3. If not found, use FIND command (ignoring permission errors)
-if [ -z "$FOUND_LOC" ]; then
-    log_info "Not found in standard paths. Searching system..."
-    
-    # Construct find command
-    # We look in / but exclude proc/sys/dev/mnt to avoid hanging
-    # 2>/dev/null hides the "Permission denied" spam
-    if $CAN_SUDO; then
-        FOUND_LOC=$(sudo find / -maxdepth 5 -name "cert.pem" -not -path "*/proc/*" 2>/dev/null | grep "cloudflared" | head -n 1)
-    else
-        FOUND_LOC=$(find / -maxdepth 5 -name "cert.pem" -not -path "*/proc/*" 2>/dev/null | grep "cloudflared" | head -n 1)
-    fi
+# Ensure we have the cert locally before running cloudflared commands
+if [ ! -f "$TARGET_CERT" ]; then
+    log_error "Critical: Certificate file missing at $TARGET_CERT. Script logic failed."
+    exit 1
 fi
 
-# 4. Process the found file
-if [ -n "$FOUND_LOC" ]; then
-    log_success "Certificate found at: $FOUND_LOC"
-    
-    # Copy logic
-    if [ "$FOUND_LOC" != "$TARGET_CERT" ]; then
-        if $CAN_SUDO; then
-            sudo cp "$FOUND_LOC" "$TARGET_CERT"
-            sudo chown $USER:$USER "$TARGET_CERT"
-        else
-            cp "$FOUND_LOC" "$TARGET_CERT"
-        fi
-    fi
-    CERT_FOUND=true
-fi
-
-# 5. FINAL FALLBACK: Ask User
-if [ "$CERT_FOUND" = false ]; then
-    log_warning "Automatic search failed."
-    echo ""
-    echo "Please open a new terminal, find your 'cert.pem' file, and copy the full path."
-    read -p "Paste the full path to cert.pem here (or press Enter to login again): " MANUAL_PATH
-    
-    if [ -n "$MANUAL_PATH" ]; then
-        # Remove quotes if user added them
-        MANUAL_PATH=$(echo "$MANUAL_PATH" | tr -d '"' | tr -d "'")
-        
-        if $CAN_SUDO; then
-            sudo cp "$MANUAL_PATH" "$TARGET_CERT"
-            sudo chown $USER:$USER "$TARGET_CERT"
-            CERT_FOUND=true
-        elif [ -r "$MANUAL_PATH" ]; then
-            cp "$MANUAL_PATH" "$TARGET_CERT"
-            CERT_FOUND=true
-        else
-            log_error "Cannot read file at $MANUAL_PATH (Permission denied?)"
-        fi
-    fi
-fi
-
-# 6. If STILL not found, force login
-if [ "$CERT_FOUND" = false ]; then
-    log_warning "No certificate provided. Initiating login..."
-    cloudflared tunnel login
-fi
-
-#############################################################################
-# STEP 7: Tunnel Setup
-#############################################################################
-
-log_info "Step 4/8: Configuring Tunnel..."
-
-# Reuse existing or create new
+log_info "Creating Tunnel..."
+# Check if tunnel exists, if not create it
 EXISTING_ID=$(cloudflared tunnel list 2>/dev/null | grep -w "$TUNNEL_NAME" | awk '{print $1}' || true)
 
 if [ -n "$EXISTING_ID" ]; then
     TUNNEL_ID="$EXISTING_ID"
-    log_success "Using ID: $TUNNEL_ID"
+    log_success "Using existing tunnel ID: $TUNNEL_ID"
 else
-    TUNNEL_OUT=$(cloudflared tunnel create $TUNNEL_NAME 2>&1)
+    # Create tunnel and capture ID
+    TUNNEL_OUT=$(cloudflared tunnel create "$TUNNEL_NAME" 2>&1)
     TUNNEL_ID=$(echo "$TUNNEL_OUT" | grep -oP '[a-f0-9]{8}-([a-f0-9]{4}-){3}[a-f0-9]{12}' | head -1)
-    log_success "Created ID: $TUNNEL_ID"
+    
+    if [ -z "$TUNNEL_ID" ]; then
+        log_error "Failed to create tunnel. Ensure cert.pem is valid."
+        echo "$TUNNEL_OUT"
+        exit 1
+    fi
+    log_success "Created new tunnel ID: $TUNNEL_ID"
 fi
 
-# Find credentials (similar robust search)
-log_info "Step 5/8: Finding Credentials..."
-CRED_NAME="${TUNNEL_ID}.json"
-CRED_FILE=""
+# Locate the Credential JSON file (Cloudflared creates this where the cert is)
+# It might be in ~/.cloudflared or it might have failed to move if we ran sudo
+log_info "Locating tunnel credentials..."
 
-# Check home
-if [ -f "$HOME/.cloudflared/$CRED_NAME" ]; then
-    CRED_FILE="$HOME/.cloudflared/$CRED_NAME"
-# Check root/system
-elif $CAN_SUDO; then
-    CRED_FILE=$(sudo find / -name "$CRED_NAME" 2>/dev/null | head -n 1)
-else
-    CRED_FILE=$(find / -name "$CRED_NAME" 2>/dev/null | head -n 1)
+CRED_JSON="${TUNNEL_ID}.json"
+FOUND_CRED=""
+
+if [ -f "$LOCAL_CERT_DIR/$CRED_JSON" ]; then
+    FOUND_CRED="$LOCAL_CERT_DIR/$CRED_JSON"
+elif sudo test -f "/root/.cloudflared/$CRED_JSON"; then
+    FOUND_CRED="/root/.cloudflared/$CRED_JSON"
 fi
 
-if [ -z "$CRED_FILE" ]; then
-    log_error "Credentials file $CRED_NAME not found!"
+if [ -z "$FOUND_CRED" ]; then
+    # Deep search if standard paths fail
+    FOUND_CRED=$(sudo find / -name "$CRED_JSON" 2>/dev/null | head -n 1)
+fi
+
+if [ -z "$FOUND_CRED" ]; then
+    log_error "Could not find credential file: $CRED_JSON"
     exit 1
 fi
 
-log_success "Credentials found: $CRED_FILE"
+log_success "Found credentials at $FOUND_CRED"
+sudo cp "$FOUND_CRED" "$INSTALL_DIR/cloudflared/"
+sudo chmod 644 "$INSTALL_DIR/cloudflared/$CRED_JSON"
 
-# Copy to install dir
-if $CAN_SUDO; then
-    sudo cp "$CRED_FILE" "$INSTALL_DIR/cloudflared/"
-    sudo chmod 644 "$INSTALL_DIR/cloudflared/$(basename $CRED_FILE)"
-else
-    cp "$CRED_FILE" "$INSTALL_DIR/cloudflared/"
-fi
-
-# Config.yml
+# Create Tunnel Config
 cat > $INSTALL_DIR/cloudflared/config.yml << EOF
 tunnel: $TUNNEL_ID
 credentials-file: /etc/cloudflared/${TUNNEL_ID}.json
 ingress:
-  - hostname: $MAIN_DOMAIN
+  - hostname: $DOMAIN_NAME
     service: http://nginx:80
   - hostname: $API_DOMAIN
     service: http://nginx:80
@@ -303,27 +323,24 @@ ingress:
   - service: http_status:404
 EOF
 
-#############################################################################
-# STEP 8: Launch
-#############################################################################
+step 6 "Deployment"
 
-log_info "Step 6/8: Routing DNS..."
-cloudflared tunnel route dns -f $TUNNEL_NAME $MAIN_DOMAIN >/dev/null 2>&1 || true
-cloudflared tunnel route dns -f $TUNNEL_NAME $API_DOMAIN >/dev/null 2>&1 || true
-cloudflared tunnel route dns -f $TUNNEL_NAME $AI_DOMAIN >/dev/null 2>&1 || true
+# DNS Routing
+log_info "Updating DNS records..."
+cloudflared tunnel route dns -f "$TUNNEL_NAME" "$DOMAIN_NAME" || true
+cloudflared tunnel route dns -f "$TUNNEL_NAME" "$API_DOMAIN" || true
+cloudflared tunnel route dns -f "$TUNNEL_NAME" "$AI_DOMAIN" || true
 
-log_info "Step 7/8: Launching Services..."
-cd $INSTALL_DIR
+log_info "Starting Containers..."
+cd "$INSTALL_DIR"
+sudo docker compose down --remove-orphans 2>/dev/null || true
+sudo docker compose up -d --build
 
-if $CAN_SUDO; then
-    sudo docker compose down 2>/dev/null || true
-    sudo docker compose up -d --build
-else
-    # Try without sudo if user is in docker group
-    docker compose down 2>/dev/null || true
-    docker compose up -d --build
-fi
-
+step 7 "Status"
 echo ""
 log_success "DEPLOYMENT COMPLETE!"
-echo "Main: https://$MAIN_DOMAIN"
+echo "----------------------------------------------------"
+echo "  Main Site:   https://$DOMAIN_NAME"
+echo "  API:         https://$API_DOMAIN"
+echo "  AI Service:  https://$AI_DOMAIN"
+echo "----------------------------------------------------"
