@@ -1,93 +1,92 @@
 #!/bin/bash
 
 # =============================================================================
-# Minecraft Bedrock Server Auto-Installer for Ubuntu
+# Minecraft Bedrock Server Auto-Installer (Ubuntu Server)
 # =============================================================================
-# Features:
-# 1. Installs dependencies (curl, wget, unzip, libcurl4)
-# 2. Creates a dedicated user 'mcbedrock' for security
-# 3. Scrapes the official website for the latest version URL
-# 4. Downloads and installs the server to /opt/minecraft_bedrock
-# 5. Configures UFW firewall
-# 6. Creates a Systemd service for auto-start on reboot
+# ✔ No HTML scraping
+# ✔ Uses official direct download URL
+# ✔ Safe permissions
+# ✔ Systemd hardened
+# ✔ UFW handled gracefully
 # =============================================================================
 
-set -e # Exit on error
+set -euo pipefail
 
-# Variables
+### -------- VARIABLES -------- ###
 USER_NAME="mcbedrock"
 INSTALL_DIR="/opt/minecraft_bedrock"
-SERVICE_FILE="/etc/systemd/system/bedrock.service"
 BACKUP_DIR="/opt/minecraft_backups"
+SERVICE_FILE="/etc/systemd/system/bedrock.service"
+VERSION="1.21.132.3"
+DOWNLOAD_URL="https://www.minecraft.net/bedrockdedicatedserver/bin-linux/bedrock-server-${VERSION}.zip"
 
-echo ">>> Starting Minecraft Bedrock Server Installation..."
+### -------- ROOT CHECK -------- ###
+if [[ $EUID -ne 0 ]]; then
+  echo "❌ Please run as root (sudo)"
+  exit 1
+fi
 
-# 1. Update and Install Dependencies
-echo ">>> Updating system and installing dependencies..."
-apt-get update -q
-apt-get install -y unzip wget curl libcurl4 ufw grep
+echo "🚀 Installing Minecraft Bedrock Server ${VERSION}"
 
-# 2. Create Dedicated User
+### -------- DEPENDENCIES -------- ###
+echo "📦 Installing dependencies..."
+apt-get update -qq
+apt-get install -y unzip wget curl libcurl4 ufw ca-certificates
+
+### -------- USER SETUP -------- ###
 if id "$USER_NAME" &>/dev/null; then
-    echo ">>> User '$USER_NAME' already exists. Skipping user creation."
+    echo "👤 User '$USER_NAME' already exists"
 else
-    echo ">>> Creating dedicated user '$USER_NAME'..."
-    useradd -r -m -d $INSTALL_DIR -s /bin/bash $USER_NAME
+    echo "👤 Creating user '$USER_NAME'"
+    useradd --system --create-home --home-dir /home/$USER_NAME --shell /usr/sbin/nologin "$USER_NAME"
 fi
 
-# 3. Create Directories
-echo ">>> Setting up directories..."
-mkdir -p $INSTALL_DIR
-mkdir -p $BACKUP_DIR
-chown $USER_NAME:$USER_NAME $BACKUP_DIR
+### -------- DIRECTORIES -------- ###
+echo "📁 Creating directories..."
+mkdir -p "$INSTALL_DIR" "$BACKUP_DIR"
+chown -R "$USER_NAME:$USER_NAME" "$INSTALL_DIR" "$BACKUP_DIR"
 
-# 4. Fetch Latest Download URL
-echo ">>> Finding latest Bedrock Server version..."
-# We scrape the official page for the linux zip link.
-# Note: This relies on the specific HTML structure of the download page.
-DOWNLOAD_URL="https://www.minecraft.net/bedrockdedicatedserver/bin-linux/bedrock-server-1.21.132.3.zip"
-if [ -z "$DOWNLOAD_URL" ]; then
-    echo "!!! Error: Could not automatically detect the download URL."
-    echo "!!! Please download the zip manually from minecraft.net and place it in $INSTALL_DIR."
-    exit 1
+### -------- DOWNLOAD -------- ###
+echo "⬇ Downloading Bedrock Server..."
+cd "$INSTALL_DIR"
+
+sudo -u "$USER_NAME" wget -q --show-progress -O server.zip "$DOWNLOAD_URL"
+
+echo "📦 Extracting..."
+sudo -u "$USER_NAME" unzip -oq server.zip
+rm -f server.zip
+
+chmod +x "$INSTALL_DIR/bedrock_server"
+chown -R "$USER_NAME:$USER_NAME" "$INSTALL_DIR"
+
+### -------- FIREWALL -------- ###
+echo "🔥 Configuring firewall..."
+if ufw status | grep -q "Status: active"; then
+    ufw allow 19132/udp
+    echo "✔ UFW rule added (19132/udp)"
 else
-    echo ">>> Found version: $DOWNLOAD_URL"
+    echo "⚠ UFW inactive — skipping firewall rule"
 fi
 
-# 5. Download and Install
-echo ">>> Downloading server files..."
-cd $INSTALL_DIR
-# Run as the mcbedrock user to keep permissions clean
-sudo -u $USER_NAME wget -O server.zip "$DOWNLOAD_URL"
+### -------- SYSTEMD SERVICE -------- ###
+echo "⚙ Creating systemd service..."
 
-echo ">>> Unzipping..."
-sudo -u $USER_NAME unzip -o server.zip
-sudo -u $USER_NAME rm server.zip
-
-# 6. Configure Firewall
-echo ">>> Configuring Firewall (UFW)..."
-ufw allow 19132/udp
-echo ">>> Port 19132/UDP allowed."
-
-# 7. Create Systemd Service
-echo ">>> Creating Systemd Service at $SERVICE_FILE..."
-
-cat <<EOF > $SERVICE_FILE
+cat > "$SERVICE_FILE" <<EOF
 [Unit]
 Description=Minecraft Bedrock Server
-After=network.target
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 User=$USER_NAME
 Group=$USER_NAME
 WorkingDirectory=$INSTALL_DIR
-# LD_LIBRARY_PATH is required for Bedrock to find its libraries
-Environment="LD_LIBRARY_PATH=$INSTALL_DIR"
-# ExecStart runs the server
+Environment=LD_LIBRARY_PATH=$INSTALL_DIR
 ExecStart=$INSTALL_DIR/bedrock_server
-# Restart automatically if it crashes
 Restart=always
 RestartSec=10
+LimitNOFILE=100000
+
 StandardOutput=journal
 StandardError=journal
 
@@ -95,20 +94,22 @@ StandardError=journal
 WantedBy=multi-user.target
 EOF
 
-# 8. Start the Server
-echo ">>> Reloading daemon and starting server..."
+chmod 644 "$SERVICE_FILE"
+
+### -------- START SERVICE -------- ###
+echo "▶ Starting server..."
 systemctl daemon-reload
 systemctl enable bedrock.service
-systemctl start bedrock.service
+systemctl restart bedrock.service
 
-echo "========================================================="
-echo "   INSTALLATION COMPLETE!"
-echo "========================================================="
-echo "1. Service Status:  sudo systemctl status bedrock"
-echo "2. View Logs:       sudo journalctl -u bedrock -f"
-echo "3. Stop Server:     sudo systemctl stop bedrock"
-echo "4. Start Server:    sudo systemctl start bedrock"
-echo "5. Config File:     $INSTALL_DIR/server.properties"
+### -------- DONE -------- ###
 echo ""
-echo "Your server should now be reachable on Port 19132."
-echo "========================================================="
+echo "====================================================="
+echo "✅ Minecraft Bedrock Server Installed Successfully!"
+echo "====================================================="
+echo "Service Status : systemctl status bedrock"
+echo "View Logs      : journalctl -u bedrock -f"
+echo "Server Files   : $INSTALL_DIR"
+echo "Config File    : $INSTALL_DIR/server.properties"
+echo "Port           : 19132/UDP"
+echo "====================================================="
