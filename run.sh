@@ -1,9 +1,9 @@
 #!/bin/bash
 
 #############################################################################
-# Complete Multi-Service Deployment Script
+# Complete Multi-Service Deployment Script (Refined)
 # Deploys Docker + NGINX + Cloudflare Tunnel setup on Ubuntu Server
-# 100% FREE - Works with any domain (DuckDNS, nic.us.kg, etc.)
+# Fixed: Docker Repository, DNS Routing, and Permissions
 #############################################################################
 
 set -e  # Exit on error
@@ -29,12 +29,13 @@ error_exit() {
 
 # Check if running as root
 if [ "$EUID" -eq 0 ]; then 
-    error_exit "Please DO NOT run this script as root. Run as normal user with sudo access."
+    error_exit "Please DO NOT run this script as root. Run as a normal user with sudo access."
 fi
 
 # Check sudo access
 if ! sudo -n true 2>/dev/null; then
-    log_warning "This script requires sudo access. You may be prompted for password."
+    log_warning "This script requires sudo access. You may be prompted for your password."
+    sudo -v
 fi
 
 #############################################################################
@@ -43,7 +44,7 @@ fi
 
 clear
 echo "=========================================="
-echo "  Multi-Service Deployment Setup"
+echo "  Multi-Service Deployment Setup (v2.0)"
 echo "=========================================="
 echo ""
 
@@ -51,7 +52,7 @@ log_info "Please provide the following information:"
 echo ""
 
 # Get domain name
-read -p "Enter your domain name (e.g., rovira.qzz.io or myserver.duckdns.org): " DOMAIN_NAME
+read -p "Enter your domain name (Must be active on Cloudflare, e.g., mysite.com): " DOMAIN_NAME
 if [ -z "$DOMAIN_NAME" ]; then
     error_exit "Domain name cannot be empty"
 fi
@@ -73,7 +74,6 @@ read -p "Enter Cloudflare tunnel name [default: myserver]: " TUNNEL_NAME
 TUNNEL_NAME=${TUNNEL_NAME:-myserver}
 
 # Installation directory
-INSTALL_DIR="/srv"
 read -p "Enter installation directory [default: /srv]: " USER_INSTALL_DIR
 INSTALL_DIR=${USER_INSTALL_DIR:-/srv}
 
@@ -94,40 +94,48 @@ if [[ ! "$CONFIRM" =~ ^[Yy]$ ]]; then
 fi
 
 #############################################################################
-# STEP 1: System Update
+# STEP 1: System Update & Prerequisites
 #############################################################################
 
-log_info "Step 1/12: Updating system packages..."
+log_info "Step 1/12: Updating system and installing prerequisites..."
 sudo apt update -qq
-sudo apt upgrade -y -qq
-log_success "System updated"
+sudo apt install -y ca-certificates curl gnupg lsb-release -qq
+log_success "System prerequisites installed"
 
 #############################################################################
-# STEP 2: Install Docker & Docker Compose
+# STEP 2: Install Docker (Official Repo Method)
 #############################################################################
 
-log_info "Step 2/12: Installing Docker..."
+log_info "Step 2/12: Installing Docker from Official Repository..."
 
-if ! command -v docker &> /dev/null; then
-    sudo apt install -y docker.io docker-compose-plugin
-    sudo systemctl enable docker
-    sudo systemctl start docker
-    
-    # Add user to docker group
-    sudo usermod -aG docker $USER
-    
-    log_success "Docker installed"
-    log_warning "You'll need to logout and login again after this script completes for Docker group to take effect"
-else
-    log_success "Docker already installed"
+# 1. Add Docker's official GPG key:
+sudo install -m 0755 -d /etc/apt/keyrings
+if [ -f /etc/apt/keyrings/docker.gpg ]; then
+    sudo rm /etc/apt/keyrings/docker.gpg
 fi
+curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+sudo chmod a+r /etc/apt/keyrings/docker.gpg
 
-# Verify Docker installation
-if ! docker --version &> /dev/null; then
-    error_exit "Docker installation failed"
-fi
+# 2. Add the repository to Apt sources:
+echo \
+  "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu \
+  $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | \
+  sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
 
-log_success "Docker version: $(docker --version)"
+# 3. Install Docker packages
+sudo apt update -qq
+sudo apt install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+
+# 4. Enable Docker
+sudo systemctl enable docker
+sudo systemctl start docker
+
+# 5. Add user to docker group
+sudo usermod -aG docker $USER
+
+log_success "Docker installed successfully"
+log_info "Docker Version: $(docker --version)"
+log_info "Compose Version: $(docker compose version)"
 
 #############################################################################
 # STEP 3: Install Cloudflared
@@ -137,6 +145,7 @@ log_info "Step 3/12: Installing Cloudflare Tunnel (cloudflared)..."
 
 if ! command -v cloudflared &> /dev/null; then
     cd /tmp
+    # Explicitly fetching .deb for amd64 (most common)
     curl -sL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb -o cloudflared.deb
     sudo dpkg -i cloudflared.deb
     rm cloudflared.deb
@@ -144,8 +153,6 @@ if ! command -v cloudflared &> /dev/null; then
 else
     log_success "Cloudflared already installed"
 fi
-
-log_success "Cloudflared version: $(cloudflared --version)"
 
 #############################################################################
 # STEP 4: Create Directory Structure
@@ -164,6 +171,7 @@ log_success "Directory structure created at $INSTALL_DIR"
 
 log_info "Step 5/12: Creating NGINX configuration..."
 
+# Note: We escape $ variables intended for Nginx config so Bash doesn't expand them
 cat > $INSTALL_DIR/nginx/nginx.conf << EOF
 events {
     worker_connections 1024;
@@ -245,15 +253,10 @@ log_info "Step 6/12: Creating service files..."
 # API Service (FastAPI)
 cat > $INSTALL_DIR/services/api/Dockerfile << 'EOF'
 FROM python:3.11-slim
-
 WORKDIR /app
-
 RUN pip install --no-cache-dir fastapi uvicorn[standard]
-
 COPY main.py .
-
 EXPOSE 8000
-
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
 EOF
 
@@ -286,28 +289,15 @@ def read_root():
 @app.get("/health")
 def health_check():
     return {"status": "healthy", "service": "api"}
-
-@app.get("/info")
-def info():
-    return {
-        "service": "API",
-        "version": "1.0.0",
-        "endpoints": ["/", "/health", "/info"]
-    }
 EOF
 
 # AI Service (Streamlit)
 cat > $INSTALL_DIR/services/ai/Dockerfile << 'EOF'
 FROM python:3.11-slim
-
 WORKDIR /app
-
 RUN pip install --no-cache-dir streamlit pandas numpy
-
 COPY app.py .
-
 EXPOSE 8501
-
 CMD ["streamlit", "run", "app.py", "--server.port=8501", "--server.address=0.0.0.0", "--server.headless=true"]
 EOF
 
@@ -317,50 +307,32 @@ import socket
 from datetime import datetime
 
 st.set_page_config(page_title="AI Service", page_icon="🤖")
-
 st.title("🤖 AI Service Dashboard")
 st.write(f"Running on **$AI_DOMAIN**")
-
 st.divider()
 
 col1, col2, col3 = st.columns(3)
-
-with col1:
-    st.metric("Status", "Online", "✅")
-    
-with col2:
-    st.metric("Service", "AI/ML")
-    
-with col3:
-    st.metric("Version", "1.0.0")
+col1.metric("Status", "Online", "✅")
+col2.metric("Service", "AI/ML")
+col3.metric("Version", "1.0.0")
 
 st.divider()
-
-st.subheader("Interactive Demo")
 name = st.text_input("Enter your name:", placeholder="John Doe")
-
 if name:
-    st.success(f"👋 Hello, **{name}**! The AI service is ready.")
-    
-    if st.button("Generate Greeting"):
+    st.success(f"👋 Hello, **{name}**!")
+    if st.button("Generate"):
         st.balloons()
-        st.write(f"🎉 Welcome to the AI-powered platform, {name}!")
+        st.write(f"🎉 Welcome to AI!")
 
-st.divider()
-
-with st.expander("System Information"):
+with st.expander("System Info"):
     st.write(f"**Hostname:** {socket.gethostname()}")
-    st.write(f"**Timestamp:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    st.write(f"**Domain:** $AI_DOMAIN")
 EOF
 
 # Frontend Service (HTML)
 cat > $INSTALL_DIR/services/frontend/Dockerfile << 'EOF'
 FROM nginx:alpine
-
 COPY index.html /usr/share/nginx/html/
 COPY nginx.conf /etc/nginx/conf.d/default.conf
-
 EXPOSE 3000
 EOF
 
@@ -370,7 +342,6 @@ server {
     server_name _;
     root /usr/share/nginx/html;
     index index.html;
-    
     location / {
         try_files $uri $uri/ /index.html;
     }
@@ -385,158 +356,20 @@ cat > $INSTALL_DIR/services/frontend/index.html << EOF
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Multi-Service Platform</title>
     <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; }
-        
-        body {
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            min-height: 100vh;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            padding: 20px;
-        }
-        
-        .container {
-            max-width: 900px;
-            width: 100%;
-        }
-        
-        .card {
-            background: white;
-            border-radius: 20px;
-            padding: 40px;
-            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
-            animation: fadeIn 0.5s ease-in;
-        }
-        
-        @keyframes fadeIn {
-            from { opacity: 0; transform: translateY(20px); }
-            to { opacity: 1; transform: translateY(0); }
-        }
-        
-        h1 {
-            color: #333;
-            margin-bottom: 10px;
-            font-size: 2.5em;
-        }
-        
-        .subtitle {
-            color: #666;
-            margin-bottom: 30px;
-            font-size: 1.1em;
-        }
-        
-        .services {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
-            gap: 20px;
-            margin: 30px 0;
-        }
-        
-        .service-card {
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            padding: 30px;
-            border-radius: 15px;
-            color: white;
-            text-decoration: none;
-            transition: transform 0.3s ease, box-shadow 0.3s ease;
-            display: block;
-        }
-        
-        .service-card:hover {
-            transform: translateY(-5px);
-            box-shadow: 0 10px 30px rgba(0,0,0,0.3);
-        }
-        
-        .service-icon {
-            font-size: 3em;
-            margin-bottom: 10px;
-        }
-        
-        .service-title {
-            font-size: 1.5em;
-            font-weight: bold;
-            margin-bottom: 5px;
-        }
-        
-        .service-desc {
-            opacity: 0.9;
-            font-size: 0.9em;
-        }
-        
-        .status {
-            background: #f8f9fa;
-            padding: 20px;
-            border-radius: 10px;
-            margin-top: 30px;
-        }
-        
-        .status-item {
-            display: flex;
-            align-items: center;
-            margin: 10px 0;
-            color: #333;
-        }
-        
-        .status-icon {
-            color: #28a745;
-            margin-right: 10px;
-            font-size: 1.2em;
-        }
-        
-        .footer {
-            text-align: center;
-            margin-top: 30px;
-            color: #666;
-            font-size: 0.9em;
-        }
+        body { font-family: sans-serif; background: #f0f2f5; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; }
+        .card { background: white; padding: 2rem; border-radius: 12px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); text-align: center; max-width: 600px; }
+        .btn { display: inline-block; margin: 10px; padding: 10px 20px; background: #007bff; color: white; text-decoration: none; border-radius: 6px; }
+        .btn:hover { background: #0056b3; }
+        h1 { margin-bottom: 0.5rem; }
     </style>
 </head>
 <body>
-    <div class="container">
-        <div class="card">
-            <h1>🚀 Multi-Service Platform</h1>
-            <p class="subtitle">Your services are live on <strong>$MAIN_DOMAIN</strong></p>
-            
-            <div class="services">
-                <a href="https://$API_DOMAIN" target="_blank" class="service-card">
-                    <div class="service-icon">🔌</div>
-                    <div class="service-title">API Service</div>
-                    <div class="service-desc">RESTful API endpoint</div>
-                </a>
-                
-                <a href="https://$AI_DOMAIN" target="_blank" class="service-card">
-                    <div class="service-icon">🤖</div>
-                    <div class="service-title">AI Service</div>
-                    <div class="service-desc">AI/ML Dashboard</div>
-                </a>
-            </div>
-            
-            <div class="status">
-                <h3 style="margin-bottom: 15px; color: #333;">System Status</h3>
-                <div class="status-item">
-                    <span class="status-icon">✅</span>
-                    <span>All services online and secured with HTTPS</span>
-                </div>
-                <div class="status-item">
-                    <span class="status-icon">✅</span>
-                    <span>Cloudflare DDoS protection active</span>
-                </div>
-                <div class="status-item">
-                    <span class="status-icon">✅</span>
-                    <span>Zero exposed ports (Cloudflare Tunnel)</span>
-                </div>
-                <div class="status-item">
-                    <span class="status-icon">✅</span>
-                    <span>Reverse proxy configured</span>
-                </div>
-            </div>
-            
-            <div class="footer">
-                <p>Powered by Docker + NGINX + Cloudflare Tunnel</p>
-                <p>100% Free Setup • Enterprise-Grade Security</p>
-            </div>
+    <div class="card">
+        <h1>🚀 Platform Online</h1>
+        <p>Main Domain: $MAIN_DOMAIN</p>
+        <div style="margin-top: 2rem;">
+            <a href="https://$API_DOMAIN" class="btn">🔌 API Service</a>
+            <a href="https://$AI_DOMAIN" class="btn">🤖 AI Service</a>
         </div>
     </div>
 </body>
@@ -551,8 +384,9 @@ log_success "Service files created"
 
 log_info "Step 7/12: Creating Docker Compose configuration..."
 
+# Note: Using version '3.8' which is broadly compatible
 cat > $INSTALL_DIR/docker-compose.yml << EOF
-version: "3.9"
+version: "3.8"
 
 services:
   nginx:
@@ -635,8 +469,9 @@ log_info "Step 8/12: Setting up Cloudflare authentication..."
 
 if [ ! -f "$HOME/.cloudflared/cert.pem" ]; then
     log_warning "Opening browser for Cloudflare authentication..."
-    log_warning "Please authorize cloudflared in your browser"
+    log_warning "You need to copy the URL below and paste it in your browser to authorize:"
     
+    # We run this in foreground so user sees the URL
     cloudflared tunnel login
     
     if [ ! -f "$HOME/.cloudflared/cert.pem" ]; then
@@ -705,4 +540,45 @@ EOF
 
 log_success "Tunnel configuration created"
 
-#################
+#############################################################################
+# STEP 11: Route DNS (CRITICAL FIX)
+#############################################################################
+
+log_info "Step 11/12: Routing DNS to Tunnel..."
+
+log_info "Routing $MAIN_DOMAIN..."
+cloudflared tunnel route dns -f $TUNNEL_NAME $MAIN_DOMAIN
+
+log_info "Routing $API_DOMAIN..."
+cloudflared tunnel route dns -f $TUNNEL_NAME $API_DOMAIN
+
+log_info "Routing $AI_DOMAIN..."
+cloudflared tunnel route dns -f $TUNNEL_NAME $AI_DOMAIN
+
+log_success "DNS records updated on Cloudflare"
+
+#############################################################################
+# STEP 12: Start Services
+#############################################################################
+
+log_info "Step 12/12: Starting services..."
+
+cd $INSTALL_DIR
+
+# Use sudo docker compose explicitly to avoid permission issues in current session
+log_info "Building and starting containers..."
+sudo docker compose build
+sudo docker compose up -d
+
+log_success "Services started!"
+echo ""
+echo "=========================================="
+echo "  Deployment Complete! 🚀"
+echo "=========================================="
+echo "  Frontend:  https://$MAIN_DOMAIN"
+echo "  API:       https://$API_DOMAIN"
+echo "  AI:        https://$AI_DOMAIN"
+echo "=========================================="
+echo "  IMPORTANT: If you see permission errors when running docker commands manually,"
+echo "  please log out and log back in for group changes to take effect."
+echo "=========================================="
